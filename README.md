@@ -1,7 +1,9 @@
 # GroCetra
 _AI-Powered Price Forecasting and Smart Shopping Strategies to Maximize Savings on Consumer Goods._
 
-[![Watch the video](https://github.com/mehedihassanarman/GroCetra/blob/main/static/images/app-logo%202.png)](https://youtu.be/EBwBUSUoxCQ)
+GroCetra was developed as a university group project by **Team BOTKNOT** during 2024-2025. This repository was refreshed in 2026 for public portfolio use and compatibility with macOS on Apple Silicon.
+
+[![Watch the GroCetra project video](static/images/app-logo%202.png)](https://youtu.be/EBwBUSUoxCQ)
 
 Amid rising inflation and economic challenges, middle- and lower-income households in Germany are facing increasing difficulties in managing grocery expenses. Our application addresses this issue by enabling users to identify the most cost-effective yet high-quality grocery options. By aggregating and comparing prices across leading supermarkets in Germany, the app ensures that consumers can access the best deals without compromising on quality, thereby optimizing their purchasing decisions and reducing overall grocery costs.
 
@@ -10,6 +12,14 @@ Beyond price comparison, the app incorporates advanced price prediction capabili
 Additionally, the app includes an expense tracking feature to support effective financial management, helping users monitor and control their grocery expenditures efficiently. Our mission is to enhance price transparency, empower informed financial decision-making, and promote sustainable shopping practices, ultimately providing meaningful relief to consumers in a challenging economic landscape.
 
 The data points that are only used to train the model have been sourced from https://rewe.nicoo.org. Apart from this, every other database belongs to us.
+
+## Main Technologies
+
+- Python 3.11 and Flask
+- SQLite with Werkzeug password hashing
+- pandas, NumPy, Matplotlib, XGBoost, scikit-learn, and SciPy
+- HTML, CSS, and JavaScript
+- Selenium and Beautiful Soup for the original data collection tools
 
 ## Setup
 
