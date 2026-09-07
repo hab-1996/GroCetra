@@ -1,5 +1,9 @@
 from pathlib import Path
+from functools import wraps
 import os
+import secrets
+import sqlite3
+import threading
 
 BASE_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("MPLCONFIGDIR", str(BASE_DIR / ".matplotlib_cache"))
@@ -19,40 +23,150 @@ import base64
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
 from datetime import datetime
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from database import (
+    add_cart_item as db_add_cart_item,
+    clear_cart as db_clear_cart,
+    create_user,
+    get_cart_items as db_get_cart_items,
+    get_purchase_history,
+    get_user_by_id,
+    get_user_by_username,
+    initialize_database,
+    remove_cart_item as db_remove_cart_item,
+    save_purchase,
+    update_cart_quantity as db_update_cart_quantity,
+    update_user_image,
+    user_exists,
+)
 
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dev-only-change-me')
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-only-change-me')
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('FLASK_COOKIE_SECURE', '').lower() == 'true'
+
+if 'FLASK_SECRET_KEY' not in os.environ:
+    app.logger.warning(
+        'Using the development-only Flask secret key. Set FLASK_SECRET_KEY outside local development.'
+    )
 
 DATASETS_DIR = BASE_DIR / 'Datasets'
 STATIC_DIR = BASE_DIR / 'static'
+DATABASE_PATH = Path(os.environ.get('GROCETRA_DB_PATH', BASE_DIR / 'instance' / 'grocetra.sqlite3'))
+CUSTOMER_IMAGE_DIR = STATIC_DIR / 'images' / 'customers'
 
 # Load required datasets for the App
-USER_EXCEL_FILE = DATASETS_DIR / 'User_Information' / 'User_data.xlsx'
-PURCHASE_HISTORY_EXCEL_FILE = DATASETS_DIR / 'Purchase_History' / 'Purchase_History.xlsx'
 FULL_ITEM_INFO_EXCEL_FILE = STATIC_DIR / 'Files' / 'Full_Item_Info.xlsx'
 WEB_SCRAPING_EXCEL_FILE = DATASETS_DIR / 'Web_Scraping' / 'Web_Scraping.xlsx'
 data = pd.read_excel(FULL_ITEM_INFO_EXCEL_FILE, sheet_name='Sheet1')
-
-# Create the user database with the required columns if it does not exist
-USER_EXCEL_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-if not os.path.exists(USER_EXCEL_FILE):
-    columns = [
-        'Customer_ID', 'FirstName', 'LastName', 'Gender', 'DateOfBirth',
-        'Country', 'City', 'Address', 'Email', 'Username', 'Password', 'Points','Image'
-    ]
-    df = pd.DataFrame(columns=columns)
-    df.to_excel(USER_EXCEL_FILE, index=False)
+initialize_database(DATABASE_PATH)
 
 
 # Convert Item's informaion to a dictionary for easy access
 items = data.to_dict(orient='records')
+PLOT_LOCK = threading.RLock()
 
-# Initiate an empty cart
-cart_items = []
+
+def synchronized_plot(function):
+    """Serialize Matplotlib rendering across Flask request threads."""
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with PLOT_LOCK:
+            return function(*args, **kwargs)
+    return wrapper
+
+
+def serialize_user(user):
+    """Return the existing template/API shape without exposing the password hash."""
+    if user is None:
+        return None
+    return {
+        'Customer_ID': user['customer_id'],
+        'FirstName': user['first_name'],
+        'LastName': user['last_name'],
+        'Username': user['username'],
+        'Points': user['points'],
+        'Image': user['image'],
+    }
+
+
+def current_user():
+    customer_id = session.get('user_id')
+    if customer_id is None:
+        return None
+    user = get_user_by_id(DATABASE_PATH, customer_id)
+    if user is None:
+        session.clear()
+    return user
+
+
+def cart_owner_key():
+    customer_id = session.get('user_id')
+    if customer_id is not None:
+        return f'user:{customer_id}'
+    if 'cart_id' not in session:
+        session['cart_id'] = secrets.token_urlsafe(18)
+    return f"guest:{session['cart_id']}"
+
+
+def cart_items_for_request():
+    cart_rows = db_get_cart_items(DATABASE_PATH, cart_owner_key())
+    detailed_items = []
+    for cart_row in cart_rows:
+        item = next((entry for entry in items if entry['Item_Code'] == cart_row['item_code']), None)
+        if item:
+            detailed_items.append({
+                'item_code': item['Item_Code'],
+                'name': item['Item_name_in_English'],
+                'category': item['Category'],
+                'uom': item['UOM'],
+                'image': item['Image'],
+                'Rewe': item['Rewe'],
+                'Netto': item['Netto'],
+                'Penny': item['Penny'],
+                'Kaufland': item['Kaufland'],
+                'AlDI': item['AlDI'],
+                'quantity': cart_row['quantity'],
+            })
+    return detailed_items
+
+
+def cart_totals(cart_items):
+    return {
+        market: sum(item[market] * item['quantity'] for item in cart_items)
+        for market in ('Rewe', 'Netto', 'Penny', 'Kaufland', 'AlDI')
+    }
+
+
+def purchase_history_dataframe(customer_id=None):
+    rows = get_purchase_history(DATABASE_PATH, customer_id)
+    columns = [
+        'Customer_ID', 'Item_Code', 'Item_Name', 'Category', 'UOM',
+        'Quantity', 'Unit Price', 'Total Price', 'Date'
+    ]
+    return pd.DataFrame(
+        [
+            {
+                'Customer_ID': row['customer_id'],
+                'Item_Code': row['item_code'],
+                'Item_Name': row['item_name'],
+                'Category': row['category'],
+                'UOM': row['uom'],
+                'Quantity': row['quantity'],
+                'Unit Price': row['unit_price'],
+                'Total Price': row['total_price'],
+                'Date': row['purchased_at'],
+            }
+            for row in rows
+        ],
+        columns=columns,
+    )
 
 # Function to generate the chart for the variable price across different supermarket
+@synchronized_plot
 def generate_chart_inline(total_prices):
     supermarkets = list(total_prices.keys())
     prices = list(total_prices.values())
@@ -87,46 +201,34 @@ def login_page():
 # Route for Login Page
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    data = request.get_json()
-    username = data.get('username').strip()  # Remove extra spaces
-    password = data.get('password').strip()  # Remove extra spaces
+    request_data = request.get_json(silent=True) or {}
+    username = str(request_data.get('username', '')).strip()
+    password = str(request_data.get('password', ''))
 
-    print(f"Login attempt: Username={username}, Password={password}")  # Debug: Print login attempt
+    if not username or not password:
+        return jsonify({'success': False, 'message': 'Username and password are required'}), 400
 
-    if os.path.exists(USER_EXCEL_FILE):
-        user_data = pd.read_excel(USER_EXCEL_FILE)
-
-        # To ensure Username and Password columns are strings and strip any extra whitespace
-        user_data['Username'] = user_data['Username'].astype(str).str.strip()
-        user_data['Password'] = user_data['Password'].astype(str).str.strip()
-
-        # To validate username and password
-        user = user_data[(user_data['Username'] == username) & (user_data['Password'] == password)]
-
-        if not user.empty:
-            session['user'] = user.iloc[0].to_dict()
-            print(f"Login successful for user: {username}")  # Debug: Print successful login
-            return jsonify({'success': True, 'message': 'Login successful! '})
-
-        print(f"Invalid login attempt for Username: {username}, Password: {password}")  # Debug: Print failed login
+    user = get_user_by_username(DATABASE_PATH, username)
+    if user is None or not check_password_hash(user['password_hash'], password):
         return jsonify({'success': False, 'message': 'Invalid username or password'}), 401
 
-    print("User database not found.")  # Debug: File not found
-    return jsonify({'success': False, 'message': 'User database was not found'}), 500
+    session.clear()
+    session['user_id'] = user['customer_id']
+    return jsonify({'success': True, 'message': 'Login successful! '})
 
 
 # Route for Home Page
 @app.route('/home')
 def home():
-    if 'user' in session:
-        return render_template('home.html', user=session['user'])
+    user = current_user()
+    if user:
+        return render_template('home.html', user=serialize_user(user))
     return redirect(url_for('login_page'))
 
 # Logout Action
 @app.route('/logout')
 def logout():
-    session.pop('user', None)
- 
+    session.clear()
     return redirect(url_for('login_page'))
 
 
@@ -134,29 +236,51 @@ def logout():
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
     if request.method == 'POST':
-        # Extract form data
-        first_name = request.form.get('firstName')
-        last_name = request.form.get('lastName')
-        gender = request.form.get('gender')
-        dob = request.form.get('dob')
-        country = request.form.get('country')
-        city = request.form.get('city')
-        address = request.form.get('address')
-        email = request.form.get('email')
-        username = request.form.get('username')
-        password = request.form.get('password')
+        first_name = request.form.get('firstName', '').strip()
+        last_name = request.form.get('lastName', '').strip()
+        gender = request.form.get('gender', '').strip()
+        dob = request.form.get('dob', '').strip()
+        country = request.form.get('country', '').strip()
+        city = request.form.get('city', '').strip()
+        address = request.form.get('address', '').strip()
+        email = request.form.get('email', '').strip()
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        repeat_password = request.form.get('repeatPassword', '')
 
-        # Load existing user data
-        df = pd.read_excel(USER_EXCEL_FILE)
+        required_fields = (
+            first_name, last_name, gender, dob, country, city, address,
+            email, username, password, repeat_password,
+        )
+        if not all(required_fields):
+            return jsonify({'success': False, 'message': 'All fields are required.'}), 400
+        if password != repeat_password:
+            return jsonify({'success': False, 'message': 'Passwords do not match!'}), 400
+        if len(password) < 8:
+            return jsonify({'success': False, 'message': 'Password must be at least 8 characters.'}), 400
 
-        # Check for duplicate email or username
-        if email in df['Email'].values:
+        if user_exists(DATABASE_PATH, email=email):
             return jsonify({'success': False, 'message': 'Email already taken!'}), 400
-        if username in df['Username'].values:
+        if user_exists(DATABASE_PATH, username=username):
             return jsonify({'success': False, 'message': 'Username already taken!'}), 400
 
-        # Generate new Customer_ID
-        customer_id = df['Customer_ID'].max() + 1 if not df.empty else 48561001
+        try:
+            customer_id = create_user(DATABASE_PATH, {
+                'first_name': first_name,
+                'last_name': last_name,
+                'gender': gender,
+                'date_of_birth': dob,
+                'country': country,
+                'city': city,
+                'address': address,
+                'email': email,
+                'username': username,
+                'password_hash': generate_password_hash(password),
+                'points': 0,
+                'image': None,
+            })
+        except sqlite3.IntegrityError:
+            return jsonify({'success': False, 'message': 'Email or username already taken!'}), 400
 
         # Geberate QR Code for new customer
         qr_data = f"https://www.example.com\nGroCetra\nCustomer ID : {customer_id}"
@@ -195,33 +319,12 @@ def signup():
         draw.multiline_text((text_x, text_y), text, fill="black", font=font, align="center")
 
         # Save the QR code image
-        qr_file_path = STATIC_DIR / 'images' / 'customers' / f'{customer_id}.png'
+        qr_file_path = CUSTOMER_IMAGE_DIR / f'{customer_id}.png'
         qr_file_path.parent.mkdir(parents=True, exist_ok=True)
         img_with_text.save(qr_file_path)
-
-
-        # Create new user 
-        new_user = pd.DataFrame([{
-            'Customer_ID': customer_id,
-            'FirstName': first_name,
-            'LastName': last_name,
-            'Gender': gender,
-            'DateOfBirth': dob,
-            'Country': country,
-            'City': city,
-            'Address': address,
-            'Email': email,
-            'Username': username,
-            'Password': password,
-            'Points': 0,
-            'Image': f"/static/images/customers/{customer_id}.png"  # Store browser path in the Excel file
-        }])
-
-        # Concatenate the new user data with the existing DataFrame
-        df = pd.concat([df, new_user], ignore_index=True)
-
-        # Save the updated data back to the user database
-        df.to_excel(USER_EXCEL_FILE, index=False)
+        update_user_image(
+            DATABASE_PATH, customer_id, f'/static/images/customers/{customer_id}.png'
+        )
 
         return jsonify({'success': True, 'message': 'Welcome! Your account has been created successfully.'}), 200
 
@@ -231,17 +334,14 @@ def signup():
 # Check Duplicate Email or Username
 @app.route('/api/check-duplicate', methods=['POST'])
 def check_duplicate():
-    data = request.json
-    email = data.get('email')
-    username = data.get('username')
+    request_data = request.get_json(silent=True) or {}
+    email = str(request_data.get('email', '')).strip()
+    username = str(request_data.get('username', '')).strip()
 
-    # Load existing data
-    df = pd.read_excel(USER_EXCEL_FILE)
-
-    if email in df['Email'].values:
+    if email and user_exists(DATABASE_PATH, email=email):
         return jsonify({'success': False, 'message': 'This Email has already taken!'}), 400
 
-    if username in df['Username'].values:
+    if username and user_exists(DATABASE_PATH, username=username):
         return jsonify({'success': False, 'message': 'This Username hase already taken!'}), 400
 
     return jsonify({'success': True}), 200
@@ -280,57 +380,34 @@ def get_items():
 @app.route('/api/add-to-cart', methods=['POST'])
 def add_to_cart():
     """API endpoint to add items to the cart."""
-    data = request.json
-    print("Received data for adding to cart:", data)  # Debugging
-    if 'item_code' in data:
-        # Check if the item already exists in the cart
-        existing_item = next((item for item in cart_items if item['item_code'] == data['item_code']), None)
-        if existing_item:
-            existing_item['quantity'] += 1  # Increment quantity if item exists
-        else:
-            # Find the item in `items` from `get_items` and add it to the cart
-            item = next((item for item in items if item['Item_Code'] == data['item_code']), None)
-            if item:
-                cart_items.append({
-                    'item_code': item['Item_Code'],
-                    'name': item['Item_name_in_English'],
-                    'category': item['Category'],
-                    'uom': item['UOM'],
-                    'image': item['Image'],
-                    'Rewe': item['Rewe'],
-                    'Netto': item['Netto'],
-                    'Penny': item['Penny'],
-                    'Kaufland': item['Kaufland'],
-                    'AlDI': item['AlDI'],
-                    'quantity': 1,  # Default value = 1
-                })
-        print("Cart items after adding:", cart_items)  # Debugging
-        return jsonify({'message': 'Item added to cart successfully!'}), 200
-    return jsonify({'error': 'Invalid request data'}), 400
+    request_data = request.get_json(silent=True) or {}
+    try:
+        item_code = int(request_data['item_code'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'error': 'Invalid request data'}), 400
+
+    item = next((entry for entry in items if entry['Item_Code'] == item_code), None)
+    if item is None:
+        return jsonify({'error': 'Item not found'}), 404
+
+    db_add_cart_item(DATABASE_PATH, cart_owner_key(), item_code)
+    return jsonify({'message': 'Item added to cart successfully!'}), 200
 
 # Update Cart Items Action
 @app.route('/api/update-quantity', methods=['POST'])
 def update_quantity():
-    data = request.json
-    item_code = int(data['item_code'])
-    change = int(data['change'])
+    request_data = request.get_json(silent=True) or {}
+    try:
+        item_code = int(request_data['item_code'])
+        change = int(request_data['change'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'error': 'Invalid request data'}), 400
 
-    # Update the item quantity
-    for item in cart_items:
-        if item['item_code'] == item_code:
-            item['quantity'] += change
-            if item['quantity'] <= 0:
-                cart_items.remove(item)
-            break
+    db_update_cart_quantity(DATABASE_PATH, cart_owner_key(), item_code, change)
+    cart_items = cart_items_for_request()
 
     # Recalculate the total prices and generate the updated chart
-    total_prices = {
-        'Rewe': sum(item['Rewe'] * item['quantity'] for item in cart_items),
-        'Netto': sum(item['Netto'] * item['quantity'] for item in cart_items),
-        'Penny': sum(item['Penny'] * item['quantity'] for item in cart_items),
-        'Kaufland': sum(item['Kaufland'] * item['quantity'] for item in cart_items),
-        'AlDI': sum(item['AlDI'] * item['quantity'] for item in cart_items),
-    }
+    total_prices = cart_totals(cart_items)
 
     chart_url = generate_chart_inline(total_prices)
     lowest_price_supermarket = min(total_prices, key=total_prices.get)
@@ -348,27 +425,17 @@ def update_quantity():
 @app.route('/api/remove-from-cart', methods=['POST'])
 def remove_from_cart():
     try:
-        data = request.json
-        print("Request to remove item:", data)  # Debugging log
-        item_code = int(data['item_code'])
-
-        # Remove the item from the cart
-        cart_items[:] = [item for item in cart_items if item['item_code'] != item_code]
+        request_data = request.get_json(silent=True) or {}
+        item_code = int(request_data['item_code'])
+        db_remove_cart_item(DATABASE_PATH, cart_owner_key(), item_code)
+        cart_items = cart_items_for_request()
 
         # Recalculate the total prices and generate the updated chart and text
-        total_prices = {
-            'Rewe': sum(item['Rewe'] * item['quantity'] for item in cart_items),
-            'Netto': sum(item['Netto'] * item['quantity'] for item in cart_items),
-            'Penny': sum(item['Penny'] * item['quantity'] for item in cart_items),
-            'Kaufland': sum(item['Kaufland'] * item['quantity'] for item in cart_items),
-            'AlDI': sum(item['AlDI'] * item['quantity'] for item in cart_items),
-        }
+        total_prices = cart_totals(cart_items)
 
         chart_url = generate_chart_inline(total_prices)
         lowest_price_supermarket = min(total_prices, key=total_prices.get)
         lowest_price = total_prices[lowest_price_supermarket]
-
-        print("Updated cart items:", cart_items)  # Debugging log
 
         return jsonify({
             'message': 'Item removed successfully!',
@@ -377,46 +444,25 @@ def remove_from_cart():
             'lowest_price': lowest_price
         }), 200
 
-    except Exception as e:
-        print("Error while removing item from cart:", str(e))  # Debugging log
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'message': 'Invalid request data.'}), 400
+    except sqlite3.Error:
+        app.logger.exception('Could not remove an item from the cart')
         return jsonify({'message': 'An error occurred while removing the item.'}), 500
 
 # Check Cart Status
 @app.route('/api/cart-status', methods=['GET'])
 def cart_status():
     """API endpoint to check if the cart is empty."""
-    return jsonify({'is_cart_empty': len(cart_items) == 0})
+    return jsonify({'is_cart_empty': len(cart_items_for_request()) == 0})
 
 # Route for Cart Page
 @app.route('/cart')
 def cart():
-    # Generate detailed cart items
-    detailed_cart_items = []
-    for cart_item in cart_items:
-        matching_item = next((item for item in items if item['Item_Code'] == cart_item['item_code']), None)
-        if matching_item:
-            detailed_cart_items.append({
-                'item_code': cart_item['item_code'],
-                'name': matching_item['Item_name_in_English'],
-                'category': matching_item['Category'],
-                'uom': matching_item['UOM'],
-                'image': matching_item['Image'],
-                'quantity': cart_item['quantity'],
-                'Rewe': matching_item['Rewe'],
-                'Netto': matching_item['Netto'],
-                'Penny': matching_item['Penny'],
-                'Kaufland': matching_item['Kaufland'],
-                'AlDI': matching_item['AlDI'],
-            })
+    detailed_cart_items = cart_items_for_request()
 
     # Calculate total prices
-    total_prices = {
-        'Rewe': sum(item['Rewe'] * item['quantity'] for item in detailed_cart_items),
-        'Netto': sum(item['Netto'] * item['quantity'] for item in detailed_cart_items),
-        'Penny': sum(item['Penny'] * item['quantity'] for item in detailed_cart_items),
-        'Kaufland': sum(item['Kaufland'] * item['quantity'] for item in detailed_cart_items),
-        'AlDI': sum(item['AlDI'] * item['quantity'] for item in detailed_cart_items),
-    }
+    total_prices = cart_totals(detailed_cart_items)
 
     # Generate the comparison chart
     chart_url = generate_chart_inline(total_prices)
@@ -424,11 +470,6 @@ def cart():
     # Find the lowest price
     lowest_price_supermarket = min(total_prices, key=total_prices.get)
     lowest_price = total_prices[lowest_price_supermarket]
-
-    # Debugging
-    print("Chart URL:", chart_url[:50])
-    print("Lowest Price Supermarket:", lowest_price_supermarket)
-    print("Lowest Price:", lowest_price)
 
     return render_template('cart.html',
                            cart_items=detailed_cart_items,
@@ -441,92 +482,42 @@ def cart():
 @app.route('/api/clear-cart', methods=['POST'])
 def clear_cart():
     """Clear all items from the cart."""
-    global cart_items
-    cart_items = []  # Reset the cart to an empty list
-    print("Cart cleared. Current cart items:", cart_items)  # Debugging log
+    db_clear_cart(DATABASE_PATH, cart_owner_key())
     return jsonify({'message': 'Cart cleared successfully!'}), 200
 
 # Pass the information of Cart Items to Purchase History Database
 @app.route('/api/save-cart', methods=['POST'])
 def save_cart():
-    """Save cart items to PURCHASE_HISTORY_EXCEL_FILE."""
-    global cart_items
-
-    # Load the existing purchase history data
-    if os.path.exists(PURCHASE_HISTORY_EXCEL_FILE):
-        purchase_history = pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
-    else:
-        # Create a new DataFrame if the file doesn't exist
-        columns = ['Customer_ID', 'Item_Code', 'Quantity', 'Total Price', 'Date']
-        purchase_history = pd.DataFrame(columns=columns)
-
-    # Get the current user
-    user = session.get('user')
+    """Save the current user's cart and points in one SQLite transaction."""
+    user = current_user()
     if not user:
         return jsonify({'success': False, 'message': 'User not logged in.'}), 401
 
-    customer_id = user.get('Customer_ID')
-    if not customer_id:
-        return jsonify({'success': False, 'message': 'Customer ID not found in session.'}), 400
+    owner_key = cart_owner_key()
+    cart_items = cart_items_for_request()
+    if not cart_items:
+        return jsonify({'success': False, 'message': 'Your cart is empty.'}), 400
 
-
-        # Recalculate the total prices and generate the updated chart and text
-    total_prices = {
-        'Rewe': sum(item['Rewe'] * item['quantity'] for item in cart_items),
-        'Netto': sum(item['Netto'] * item['quantity'] for item in cart_items),
-        'Penny': sum(item['Penny'] * item['quantity'] for item in cart_items),
-        'Kaufland': sum(item['Kaufland'] * item['quantity'] for item in cart_items),
-        'AlDI': sum(item['AlDI'] * item['quantity'] for item in cart_items),
-    }
-
-
+    total_prices = cart_totals(cart_items)
     lowest_price_supermarket = min(total_prices, key=total_prices.get)
     new_points = int(float(total_prices[lowest_price_supermarket]))
-    print("Supermarket Name : ",lowest_price_supermarket)
-    print("New Points : ",new_points)
-
-    # Update the Points in User Database
-    user_data = pd.read_excel(USER_EXCEL_FILE)
-    if customer_id in user_data['Customer_ID'].values:
-        user_data.loc[user_data['Customer_ID'] == customer_id, 'Points'] += new_points
-        updated_points = user_data.loc[user_data['Customer_ID'] == customer_id, 'Points'].values[0]
-        user_data.to_excel(USER_EXCEL_FILE, index=False)
-
-        # Update the session with the new points
-        session['user']['Points'] = updated_points
-    else:
-        return jsonify({'success': False, 'message': 'User not found in the database.'}), 400
-
-
-
-    # Add cart items to the purchase history
     today_date = datetime.now().strftime('%Y-%m-%d')
-    new_entries = []
-
-    for item in cart_items:
-        # Calculate the total price for each item
-        total_price = item['quantity'] * item[lowest_price_supermarket] 
-        new_entries.append({
-            'Customer_ID': customer_id,
-            'Item_Code': item['item_code'],
-            'Item_Name': item['name'],
-            'Category': item['category'],
-            'UOM': item['uom'],
-            'Quantity': item['quantity'],
-            'Unit Price': item[lowest_price_supermarket],
-            'Total Price': total_price,
-            'Date': today_date
-        })
-
-    # Append the new entries to the existing DataFrame
-    new_entries_df = pd.DataFrame(new_entries)
-    purchase_history = pd.concat([purchase_history, new_entries_df], ignore_index=True)
-
-    # Save the updated purchase history back to the Excel file
-    purchase_history.to_excel(PURCHASE_HISTORY_EXCEL_FILE, index=False)
-
-    # Clear the cart after saving
-    cart_items = []
+    entries = [
+        {
+            'item_code': item['item_code'],
+            'item_name': item['name'],
+            'category': item['category'],
+            'uom': item['uom'],
+            'quantity': item['quantity'],
+            'unit_price': item[lowest_price_supermarket],
+            'total_price': item['quantity'] * item[lowest_price_supermarket],
+            'purchased_at': today_date,
+        }
+        for item in cart_items
+    ]
+    save_purchase(
+        DATABASE_PATH, user['customer_id'], owner_key, entries, new_points
+    )
 
     return jsonify({'success': True, 'message': f'Thank you for providing the information. You will receive {new_points} points. Please scan your QR code at the Supermarket terminal to collect your points.'})
 
@@ -534,39 +525,40 @@ def save_cart():
 # Refresh User Session
 @app.route('/api/refresh-session', methods=['GET'])
 def refresh_session():
-    if 'user' in session:
-        user_data = pd.read_excel(USER_EXCEL_FILE)
-        customer_id = session['user']['Customer_ID']
-        updated_user = user_data[user_data['Customer_ID'] == customer_id].iloc[0].to_dict()
-        session['user'] = updated_user  # Update the session with fresh data
-        return jsonify({'success': True, 'user': session['user']})
+    user = current_user()
+    if user:
+        return jsonify({'success': True, 'user': serialize_user(user)})
     return jsonify({'success': False, 'message': 'User not logged in.'}), 401
 
 
 #Route for QR Code
 @app.route('/qr_code')
 def qr_code():
-    if 'user' in session:
-        qr_code_path = session['user'].get('Image')  # Get the QR code path from the session
-        return render_template('qr_code.html', qr_code_path=qr_code_path)
+    user = current_user()
+    if user:
+        return render_template('qr_code.html', qr_code_path=user['image'])
     return redirect(url_for('login_page'))
 
 
 # Load User Details
 @app.route('/user')
 def user_dashboard():
-    if 'user' in session:
-        session['user']['ProfileImage'] = f"/static/images/customers/profile_image/{session['user']['Customer_ID']}.png"
-        return render_template('user.html', user=session['user'])
+    user = current_user()
+    if user:
+        template_user = serialize_user(user)
+        template_user['ProfileImage'] = (
+            f"/static/images/customers/profile_image/{user['customer_id']}.png"
+        )
+        return render_template('user.html', user=template_user)
     return redirect(url_for('login_page'))
 
 # To show the User expenditure over the time.
 @app.route('/user/line-chart')
+@synchronized_plot
 def user_line_chart():
-    customer_id = session['user'].get('Customer_ID')
-    data= pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
-    if customer_id:
-        customer_data = data[data['Customer_ID'] == customer_id].copy()
+    user = current_user()
+    if user:
+        customer_data = purchase_history_dataframe(user['customer_id'])
         if not customer_data.empty:
             customer_data['Date'] = pd.to_datetime(customer_data['Date'])
             customer_data['Month_Year'] = customer_data['Date'].dt.strftime('%B %Y')
@@ -608,11 +600,11 @@ def user_line_chart():
 
 #To show the montly purchase history on different categories
 @app.route('/user/bar-chart')
+@synchronized_plot
 def user_bar_chart():
-    customer_id = session['user'].get('Customer_ID')
-    data= pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
-    if customer_id:
-        customer_data = data[data['Customer_ID'] == customer_id].copy()
+    user = current_user()
+    if user:
+        customer_data = purchase_history_dataframe(user['customer_id'])
         if not customer_data.empty:
             customer_data['Date'] = pd.to_datetime(customer_data['Date'])
             customer_data['Month_Year'] = customer_data['Date'].dt.strftime('%B %Y')
@@ -653,11 +645,11 @@ def user_bar_chart():
 
 # To show the user habits on grocery items
 @app.route('/user/pie-chart')
+@synchronized_plot
 def user_pie_chart():
-    customer_id = session['user'].get('Customer_ID')
-    data= pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
-    if customer_id:
-        customer_data = data[data['Customer_ID'] == customer_id].copy()
+    user = current_user()
+    if user:
+        customer_data = purchase_history_dataframe(user['customer_id'])
         if not customer_data.empty:
             category_data = customer_data.groupby('Category')['Total Price'].sum()
 
@@ -684,8 +676,10 @@ def user_pie_chart():
 
 
 # To show the top 6 products
-def get_top_products_by_quantity(PURCHASE_HISTORY_EXCEL_FILE, top_n=6):
-    purchase_history_data = pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
+def get_top_products_by_quantity(top_n=6):
+    purchase_history_data = purchase_history_dataframe()
+    if purchase_history_data.empty:
+        return pd.DataFrame(columns=['Item_Code', 'Quantity'])
     top_products = purchase_history_data.groupby('Item_Code', as_index=False)['Quantity'].sum()
     top_products = top_products.sort_values(by='Quantity', ascending=False).head(top_n)
     return top_products
@@ -694,7 +688,7 @@ def get_top_products_by_quantity(PURCHASE_HISTORY_EXCEL_FILE, top_n=6):
 # Route for Market Analysis Page
 @app.route('/market_analysis')
 def market_analysis():
-    top_products_data = get_top_products_by_quantity(PURCHASE_HISTORY_EXCEL_FILE, top_n=6)
+    top_products_data = get_top_products_by_quantity(top_n=6)
     top_items = top_products_data['Item_Code'].tolist()
 
     # Get item details from `items` data
@@ -713,6 +707,7 @@ def market_analysis():
 
 #To show price variation in different supermarket
 @app.route('/plot/<int:item_code>')
+@synchronized_plot
 def get_price_trend_plot(item_code):
     web_scraping_data = pd.read_excel(WEB_SCRAPING_EXCEL_FILE)
 
@@ -775,8 +770,11 @@ def get_price_trend_plot(item_code):
 
 # To show the Market Size
 @app.route('/market-analysis-bar-chart')
+@synchronized_plot
 def market_analysis_bar_chart():
-    market_data = pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
+    market_data = purchase_history_dataframe()
+    if market_data.empty:
+        return "No data available", 400
 
     # Convert the 'Date' column to datetime format to extract month-year
     market_data['Date'] = pd.to_datetime(market_data['Date'])
@@ -845,9 +843,11 @@ def market_analysis_bar_chart():
 
 # To show customer's spending nature
 @app.route('/market-analysis-pie-chart')
+@synchronized_plot
 def market_analysis_pie_chart():
-    # Load data
-    market_data = pd.read_excel(PURCHASE_HISTORY_EXCEL_FILE)
+    market_data = purchase_history_dataframe()
+    if market_data.empty:
+        return "No data available", 400
 
     # Summarize data by Category and Total Price
     category_summary = market_data.groupby('Category')['Total Price'].sum()

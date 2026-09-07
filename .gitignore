@@ -37,6 +37,10 @@ output/
 # Flask/local app files
 instance/
 .webassets-cache
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
 
 # Jupyter
 .ipynb_checkpoints/
