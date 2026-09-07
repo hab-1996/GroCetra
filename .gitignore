@@ -1,0 +1,68 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.matplotlib_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and local runtime files
+*.log
+*.tmp
+*.temp
+*.pid
+output/
+
+# Flask/local app files
+instance/
+.webassets-cache
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node/frontend dependencies and builds
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+build/
+dist/
+.vite/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large ML/cache folders that should stay local
+.cache/
+hf_cache/
+huggingface_cache/
+
+# Local/private user data
+Datasets/User_Information/
+Datasets/Purchase_History/
+static/images/customers/
